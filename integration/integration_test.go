@@ -159,6 +159,8 @@ func (s *IntSuite) newTeleportWithConfig(c *check.C, logins []string, instanceSe
 // TestAuditOn creates a live session, records a bunch of data through it
 // and then reads it back and compares against simulated reality.
 func (s *IntSuite) TestAuditOn(c *check.C) {
+	now := time.Now().In(time.UTC).Round(time.Second)
+
 	var tests = []struct {
 		inRecordLocation string
 		inForwardAgent   bool
@@ -175,7 +177,8 @@ func (s *IntSuite) TestAuditOn(c *check.C) {
 		},
 	}
 
-	for _, tt := range tests {
+	for i, tt := range tests {
+		fmt.Printf("--> test %v\n", i)
 		makeConfig := func() (*check.C, []string, []*InstanceSecrets, *service.Config) {
 			clusterConfig, err := services.NewClusterConfig(services.ClusterConfigSpecV3{
 				SessionRecording: tt.inRecordLocation,
@@ -256,13 +259,44 @@ func (s *IntSuite) TestAuditOn(c *check.C) {
 			for {
 				select {
 				case <-tickCh:
-					sessions, err = site.GetSessions(defaults.Namespace)
+					idMatch := func(serverID string, allEvents []events.EventFields) events.EventFields {
+						if len(allEvents) == 0 {
+							return nil
+						}
+						for _, evnt := range allEvents {
+							if evnt.GetString(events.SessionServerID) == serverID {
+								return evnt
+							}
+						}
+						return nil
+					}
+
+					// look through the audit log for the exact session needed
+					serverID := nodeProcess.Config.HostUUID
+					if tt.inRecordLocation == services.RecordAtProxy {
+						serverID = t.Process.Config.HostUUID
+					}
+
+					eventsInSite, err := site.SearchSessionEvents(now, now.Add(1*time.Hour))
 					if err != nil {
 						return nil, trace.Wrap(err)
 					}
-					if len(sessions) > 0 {
-						return &sessions[0], nil
+					startEvent := idMatch(serverID, eventsInSite)
+					if startEvent == nil {
+						continue
 					}
+
+					sid, err := session.ParseID(startEvent.GetString("sid"))
+					if err != nil {
+						return nil, trace.Wrap(err)
+					}
+
+					sess, err := site.GetSession(defaults.Namespace, *sid)
+					if err != nil {
+						return nil, trace.Wrap(err)
+					}
+
+					return sess, nil
 				case <-stopCh:
 					return nil, trace.BadParameter("unable to find sessions after 10s (mode=%v)", tt.inRecordLocation)
 				}
@@ -350,9 +384,11 @@ func (s *IntSuite) TestAuditOn(c *check.C) {
 		// if session are being recorded at nodes, the event server_id field should contain
 		// the ID of the node. if sessions are being recorded at the proxy, then server_id
 		// should be that of the proxy
+		fmt.Printf("--> node process uuid: %v\n", nodeProcess.Config.HostUUID)
 		expectedServerID := nodeProcess.Config.HostUUID
 		if tt.inRecordLocation == services.RecordAtProxy {
 			expectedServerID = t.Process.Config.HostUUID
+			fmt.Printf("--> expecting proxy: %v\n", expectedServerID)
 		}
 		c.Assert(start.GetString(events.SessionServerID), check.Equals, expectedServerID)
 
